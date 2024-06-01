@@ -7,11 +7,31 @@ from typing import List, Dict, Any, Optional
 from models import Status, Metadata, ApiResponse, Variant, QualSummary
 from database import get_db, get_dburl, execute_query_to_dataframe
 from utils import read_query, read_vcf, format_sql_query, extract_and_upload_metadata
-import os
-import json
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+from fastapi import APIRouter, HTTPException
 import traceback
+from fastapi import FastAPI, APIRouter, HTTPException, Depends
+import httpx
+import os
+from dotenv import load_dotenv
+from starlette.responses import RedirectResponse
 
+# Load environment variables from .env file
+load_dotenv()
 app = FastAPI()
+router = APIRouter()
+origins = [
+    "*"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load SQL queries
 variant_query = read_query('./database_queries/variants_query.sql')
@@ -30,40 +50,108 @@ getRefernces_query = read_query(
 )
 getSamples_query = read_query('./database_queries/getSamples.sql')
 
+########################## TESTING##########################################
+# Using environment variables for configuration
+API_URL = os.getenv("API_URL")
+API_USERNAME = os.getenv("API_USERNAME")
+API_PASSWORD = os.getenv("API_PASSWORD")
+token_storage = {"token": 'lol'}
+
+
+@router.post("//api/Clients/login")
+async def login():
+    print('Logged in successfully')
+    return {"message": "Logged in successfully"}
+
+
+@router.get("//api/Blocks/blockFeatureLimits")
+async def get_data():
+    return RedirectResponse(url="/brapi/v2/search/variantsets")
+
+
+@router.get("/external-data")
+async def get_external_data():
+    data_url = f"{API_URL}/AnotherEndpoint"
+    async with httpx.AsyncClient() as client:
+        # Removed the Authorization header
+        response = await client.get(data_url)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code,
+                                detail="Failed to retrieve data from external API")
+        return response.json()
+
+
+app.include_router(router)
+
+#################################### TESTING################################
+
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-@app.get("/brapi/v2/variants", response_model=ApiResponse)
+@ app.get("/brapi/v2/variants", response_model=ApiResponse)
 def get_variant(
     chrom: str = Query(..., description="Chromosome of the variant"),
     pos: int = Query(...,
                      description="Position of the variant on the chromosome"),
     ref: str = Query(..., description="Reference base"),
     alt: str = Query(..., description="Alternate base"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    studyDbIds: str = Query(..., description="studyDbIds"),
+
 ):
-    sql_query = text(variant_query)
-    result = db.execute(
-        sql_query, {'chrom': chrom, 'pos': pos, 'ref': ref, 'alt': alt}).fetchone()
+    custom_query = variant_query.replace("%(table_name)s", str(studyDbIds))
+    custom_query = custom_query.replace('%(chrom)s', str(chrom))
+    custom_query = custom_query.replace('%(pos)s', str(pos))
+    custom_query = custom_query.replace('%(ref)s', str(ref))
+    custom_query = custom_query.replace('%(alt)s', str(alt))
+    print(custom_query)
+
+    sql_query = text(custom_query)
+    result = execute_query_to_dataframe(
+        sql_query)
+
     if result is None:
         return ApiResponse(metadata=Metadata(status=[Status(messageType="ERROR", message="Variant not found")]), result={})
-    variant = Variant(chromosome=result[0], position=result[1], ref=result[2],
-                      alt=result[3], quality=result[4], filter=result[5], info=result[6])
-    return ApiResponse(metadata=Metadata(status=[Status(messageType="INFO", message="Variant retrieved successfully")]), result=variant)
+    variant = Variant(
+        chromosome=result.iloc[0]['CHROM'],
+        position=int(result.iloc[0]['POS']),
+        ref=result.iloc[0]['REF'],
+        alt=result.iloc[0]['ALT'],
+        quality=float(result.iloc[0]['QUAL']),
+        filter=result.iloc[0]['FILTER'],
+        info=result.iloc[0]['INFO']
+    )
+    return ApiResponse(
+        metadata=Metadata(
+            status=[Status(messageType="INFO", message="Variant retrieved successfully")]),
+        result={"variant": variant}
+    )
 
 
-@app.get("/brapi/v2/qualsummaries", response_model=ApiResponse)
-def get_quality_summaries(db: Session = Depends(get_db)):
-    sql_query = text(quality_summaries_query)
-    result = db.execute(sql_query).fetchall()
-    if not result:
+@ app.get("/brapi/v2/qualsummaries", response_model=ApiResponse)
+def get_quality_summaries(db: Session = Depends(get_db), studyDbIds: str = Query(..., description="studyDbIds")):
+    custom_query = quality_summaries_query.replace(
+        "%(table_name)s", str(studyDbIds))
+    print(custom_query)
+    result = execute_query_to_dataframe(
+        custom_query)
+    print(result)
+    if result is None:
         return ApiResponse(metadata=Metadata(status=[Status(messageType="ERROR", message="No quality summaries found")]), result=[])
-    summaries = [QualSummary(chromosome=row[0], quality=row[1])
-                 for row in result]
-    return ApiResponse(metadata=Metadata(status=[Status(messageType="INFO", message="Quality summaries retrieved successfully")]), result=summaries)
+    summaries = [
+        QualSummary(chromosome=row['CHROM'], quality=float(row['averagequal']))
+        for _, row in result.iterrows()
+    ]
+    print(summaries)
+    return ApiResponse(
+        metadata=Metadata(status=[Status(
+            messageType="INFO", message="Quality summaries retrieved successfully")]),
+        result=summaries
+    )
 
 
-@app.post("/upload_data/")
+@ app.post("/upload_data/")
 async def upload_data(file: UploadFile = File(...), db: Session = Depends(get_dburl)):
     file_location = f"static/{file.filename}"
     print(file_location)
@@ -84,7 +172,7 @@ async def upload_data(file: UploadFile = File(...), db: Session = Depends(get_db
     return {"message": f"Metadata for {file.filename} uploaded successfully"}
 
 
-@app.get("/brapi/v2/search/variantsets")
+@ app.get("/brapi/v2/search/variantsets")
 def search_variantsets(
     page: int = Query(0, description="Page number"),
     page_size: int = Query(10, description="Number of items per page"),
@@ -147,7 +235,7 @@ def search_variantsets(
     return response
 
 
-@app.get("/brapi/v2/search/references")
+@ app.get("/brapi/v2/search/references")
 def search_references(
     page: int = Query(0, description="Page number"),
     page_size: int = Query(10, description="Number of items per page"),
@@ -200,7 +288,7 @@ def search_references(
     return response
 
 
-@app.get("/brapi/v2/search/samples")
+@ app.get("/brapi/v2/search/samples")
 def search_references(
     page: int = Query(0, description="Page number"),
     page_size: int = Query(10, description="Number of items per page"),

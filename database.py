@@ -30,7 +30,6 @@ def get_db():
 
 
 def execute_query_to_dataframe(sql_query: str, params: dict = None) -> pd.DataFrame:
-    print(sql_query)
     with engine.connect() as connection:
         df = pd.read_sql_query(sql_query, connection, params=params)
     return df

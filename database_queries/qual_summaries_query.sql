@@ -1,5 +1,5 @@
 SELECT "CHROM", AVG(CAST("QUAL" AS FLOAT)) as AverageQual
-FROM genomic_data
+FROM "%(table_name)s"
 GROUP BY "CHROM"
 ORDER BY AVG(CAST("QUAL" AS FLOAT)) DESC
 LIMIT 10;

@@ -1,3 +1,3 @@
 SELECT "CHROM", "POS", "REF", "ALT", "QUAL", "FILTER", "INFO"
-FROM genomic_data
-WHERE "CHROM" = :chrom AND "POS" = :pos AND "REF" = :ref AND "ALT" = :alt;
+FROM "%(table_name)s"
+WHERE "CHROM" = '%(chrom)s' AND "POS" = '%(pos)s'  AND "REF" = '%(ref)s'  AND "ALT" = '%(alt)s' ;
