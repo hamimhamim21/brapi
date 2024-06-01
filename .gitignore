@@ -1,3 +1,5 @@
 .venv
 GBS_filtered_SNPs.vcf
 __pycache__
+.env
+static
