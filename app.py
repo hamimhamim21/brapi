@@ -92,40 +92,41 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @ app.get("/brapi/v2/variants", response_model=ApiResponse)
 def get_variant(
     chrom: str = Query(..., description="Chromosome of the variant"),
-    pos: int = Query(...,
-                     description="Position of the variant on the chromosome"),
-    ref: str = Query(..., description="Reference base"),
-    alt: str = Query(..., description="Alternate base"),
+    ref: str = Query(...,
+                     description="ref of the variant on the chromosome"),
     db: Session = Depends(get_db),
     studyDbIds: str = Query(..., description="studyDbIds"),
-
 ):
     custom_query = variant_query.replace("%(table_name)s", str(studyDbIds))
     custom_query = custom_query.replace('%(chrom)s', str(chrom))
-    custom_query = custom_query.replace('%(pos)s', str(pos))
     custom_query = custom_query.replace('%(ref)s', str(ref))
-    custom_query = custom_query.replace('%(alt)s', str(alt))
     print(custom_query)
 
     sql_query = text(custom_query)
-    result = execute_query_to_dataframe(
-        sql_query)
+    result = execute_query_to_dataframe(sql_query)
 
-    if result is None:
+    if result is None or result.empty:
         return ApiResponse(metadata=Metadata(status=[Status(messageType="ERROR", message="Variant not found")]), result={})
-    variant = Variant(
-        chromosome=result.iloc[0]['CHROM'],
-        position=int(result.iloc[0]['POS']),
-        ref=result.iloc[0]['REF'],
-        alt=result.iloc[0]['ALT'],
-        quality=float(result.iloc[0]['QUAL']),
-        filter=result.iloc[0]['FILTER'],
-        info=result.iloc[0]['INFO']
-    )
+
+    variants = []
+    for _, row in result.iterrows():
+        variant = Variant(
+            chromosome=row['CHROM'],
+            position=int(row['POS']),
+            ref=row['REF'],
+            alt=row['ALT'],
+            quality=float(row['QUAL']),
+            filter=row['FILTER'],
+            info=row['INFO']
+        )
+        variants.append(variant)
+
     return ApiResponse(
         metadata=Metadata(
-            status=[Status(messageType="INFO", message="Variant retrieved successfully")]),
-        result={"variant": variant}
+            status=[Status(messageType="INFO",
+                           message="Variants retrieved successfully")]
+        ),
+        result={"variants": variants}
     )
 
 
