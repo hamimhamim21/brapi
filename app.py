@@ -155,8 +155,10 @@ def get_quality_summaries(db: Session = Depends(get_db), studyDbIds: str = Query
 @ app.post("/brapi/v2/upload_data/")
 async def upload_data(file: UploadFile = File(...), db: Session = Depends(get_dburl)):
     file_location = f"static/{file.filename}"
-    print(file_location)
 
+    # Check if the file already exists
+    if os.path.exists(file_location):
+        raise HTTPException(status_code=400, detail="File already exists")
     # Save the uploaded file to the static directory
     with open(file_location, "wb") as buffer:
         buffer.write(await file.read())

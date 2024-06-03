@@ -5,6 +5,12 @@ import sqlalchemy
 import json
 import os
 import re
+import tempfile
+import numpy as np
+
+
+def valid_table_name(name):
+    return re.sub(r'\W+', '_', name)
 
 
 def read_query(file_path):
@@ -31,16 +37,43 @@ def read_vcf(file: str) -> pd.DataFrame:
 # Function to upload DataFrame to PostgreSQL
 
 
-def upload_to_postgres(df: pd.DataFrame, table_name: str, engine):
-    # Ensure the table name is valid by removing/escaping any characters that aren't allowed
-    table_name = re.sub(r'\W+', '_', table_name)
-    print(table_name)
-    # Upload data to PostgreSQL table
-    df.to_sql(table_name, engine, if_exists='replace',
-              index=False, method='multi', chunksize=1000)
-    print(f"Data uploaded to table '{table_name}' in the PostgreSQL database.")
+def upload_to_postgres(df: pd.DataFrame, table_name: str, engine, chunksize=100000):
+    table_name = valid_table_name(table_name)
+    print(f"Table name after validation: {table_name}")
 
-# Function to check if study_db_id already exists
+    custom_query = read_query(
+        './database_queries/create_table_genomic_data.sql')
+    custom_query = custom_query.replace("%(table_name)s", table_name)
+
+    total_chunks = (len(df) // chunksize) + 1
+
+    with engine.connect() as connection:
+        with connection.begin():
+            connection.execute(text(custom_query))
+
+            for chunk_number, chunk in enumerate(np.array_split(df, total_chunks)):
+                chunk = chunk.rename(columns={"#CHROM": "CHROM"})
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_csv_file:
+                    chunk.to_csv(temp_csv_file.name, index=False)
+                    temp_csv_file_name = temp_csv_file.name
+
+                try:
+                    conn = connection.connection
+                    cursor = conn.cursor()
+                    with open(temp_csv_file_name, 'r') as f:
+                        cursor.copy_expert(
+                            f"COPY {table_name} FROM STDIN WITH CSV HEADER", f)
+                    conn.commit()
+                    cursor.close()
+                finally:
+                    os.remove(temp_csv_file_name)
+
+                print(
+                    f"Chunk {chunk_number + 1}/{total_chunks} uploaded to table '{table_name}'.")
+
+    print(
+        f"All data uploaded to table '{table_name}' in the PostgreSQL database.")
 
 
 def check_study_db_id_exists(study_db_id: str, table_name: str, engine) -> bool:
@@ -53,26 +86,14 @@ def check_study_db_id_exists(study_db_id: str, table_name: str, engine) -> bool:
 
 
 def extract_and_upload_metadata(file: str, database_url: str):
-    # Read VCF file
-    vcf = read_vcf(file)
+    study_db_id = 'genomic_data_' + os.path.splitext(os.path.basename(file))[0]
 
-    # Calculate call_set_count and variant_count
+    vcf = read_vcf(file)
     call_set_count = len(vcf.columns) - vcf.columns.get_loc("FORMAT") - 1
     variant_count = len(vcf)
 
-    # Extract base identifier from filename
-    study_db_id = os.path.splitext(os.path.basename(file))[0]
-
-    study_db_id = 'genomic_data_'+study_db_id
-
-    # Create SQLAlchemy engine
     engine = create_engine(database_url)
 
-    # Check if the study_db_id already exists
-    if check_study_db_id_exists(study_db_id, "vcf_metadata", engine):
-        raise Exception(f"File with study_db_id {study_db_id} already exists")
-
-    # Example metadata extraction (replace with actual extraction logic)
     metadata = {
         "data_format": "VCF",
         "file_format": "text/tsv",
@@ -93,16 +114,16 @@ def extract_and_upload_metadata(file: str, database_url: str):
         ]
     }
 
-    # Convert metadata to DataFrame
     metadata_df = pd.DataFrame([metadata])
     metadata_df["metadata_fields"] = metadata_df["metadata_fields"].apply(
         json.dumps)
 
-    # Adding study_db_id column to the VCF DataFrame
     vcf['study_db_id'] = study_db_id
-
-    # Upload metadata to PostgreSQL table
     metadata_df.to_sql('vcf_metadata', engine, if_exists='append', index=False)
+    upload_to_postgres(vcf, f'{study_db_id}', engine)
+
+    print(
+        f"Metadata uploaded to 'vcf_metadata' table and data uploaded to 'genomic_data_{study_db_id}' table in the PostgreSQL database.")
 
     # Upload genomic data to PostgreSQL with a dynamic table name
     upload_to_postgres(vcf, f'{study_db_id}', engine)
