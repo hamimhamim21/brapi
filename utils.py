@@ -1,98 +1,122 @@
-import pandas as pd
-from sqlalchemy import text, create_engine
-from sqlalchemy.orm import Session
-import sqlalchemy
-import json
 import os
-import re
-import tempfile
-import numpy as np
+import subprocess
+from pymongo import MongoClient
+import pandas as pd
 
 
-def valid_table_name(name):
-    return re.sub(r'\W+', '_', name)
-
-
-def read_query(file_path):
-    with open(file_path, 'r') as file:
-        return file.read()
-
-
-def format_sql_query(sql_query: str, placeholders: list, key: str) -> str:
-    joined_placeholders = ', '.join([f"'{item}'" for item in placeholders])
-    return sql_query % {key: joined_placeholders}
-
-
-def read_vcf(file: str) -> pd.DataFrame:
+def read_vcf_and_write_header(file: str, static_folder: str) -> str:
     num_header = 0
+    header_lines = []
+
     with open(file) as f:
         for line in f:
             if line.startswith("##"):
                 num_header += 1
-    # Read the VCF, assuming the column names are on the last line of the headers
-    vcf = pd.read_csv(file, sep="\t", skiprows=num_header, dtype=str)
-    vcf = vcf.rename(columns={"#CHROM": "CHROM"})
-    return vcf
+                continue
+            elif line.startswith("#CHROM"):
+                header_lines.append(line.strip())
+                header_lines.append(',')
+                break  # The header ends here
 
-# Function to upload DataFrame to PostgreSQL
+    # Write the header to a file in the static folder
+    header_file = os.path.join('static', "vcf_header.txt")
+
+    new_lines = [mystring for i in header_lines for mystring in i.split('\t')]
+    with open(header_file, 'w') as header_f:
+        header_f.write("\n".join(new_lines))
+
+    return header_file
 
 
-def upload_to_postgres(df: pd.DataFrame, table_name: str, engine, chunksize=100000):
-    table_name = valid_table_name(table_name)
-    print(f"Table name after validation: {table_name}")
+def remove_documents_with_field_equal_value(mongo_url: str, db_name: str, collection_name: str, fields_file: str):
+    client = MongoClient(mongo_url)
+    db = client[db_name]
+    collection = db[collection_name]
 
-    custom_query = read_query(
-        './database_queries/create_table_genomic_data.sql')
-    custom_query = custom_query.replace("%(table_name)s", table_name)
+    # Read field names from the fields file
+    with open(fields_file, 'r') as file:
+        fields = file.read().splitlines()
 
-    total_chunks = (len(df) // chunksize) + 1
+    # Find the first 100 documents
+    documents = collection.find().limit(100)
+    total_deleted = 0
 
-    with engine.connect() as connection:
-        with connection.begin():
-            connection.execute(text(custom_query))
+    for doc in documents:
+        for field in fields:
+            if field in doc and doc[field] == field:
+                collection.delete_one({"_id": doc["_id"]})
+                total_deleted += 1
+                break  # Break the inner loop as we already deleted the document
 
-            for chunk_number, chunk in enumerate(np.array_split(df, total_chunks)):
-                chunk = chunk.rename(columns={"#CHROM": "CHROM"})
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_csv_file:
-                    chunk.to_csv(temp_csv_file.name, index=False)
-                    temp_csv_file_name = temp_csv_file.name
-
-                try:
-                    conn = connection.connection
-                    cursor = conn.cursor()
-                    with open(temp_csv_file_name, 'r') as f:
-                        cursor.copy_expert(
-                            f"COPY {table_name} FROM STDIN WITH CSV HEADER", f)
-                    conn.commit()
-                    cursor.close()
-                finally:
-                    os.remove(temp_csv_file_name)
-
-                print(
-                    f"Chunk {chunk_number + 1}/{total_chunks} uploaded to table '{table_name}'.")
+        # Check if the document has only one field besides _id
+        if len(doc.keys()) == 2:  # Only _id and one other field
+            collection.delete_one({"_id": doc["_id"]})
+            total_deleted += 1
 
     print(
-        f"All data uploaded to table '{table_name}' in the PostgreSQL database.")
+        f"Deleted a total of {total_deleted} unwanted documents in '{collection_name}'.")
+
+# Function to import VCF file to MongoDB using mongoimport
 
 
-def check_study_db_id_exists(study_db_id: str, table_name: str, engine) -> bool:
-    with engine.connect() as connection:
-        result = connection.execute(text(f"SELECT 1 FROM {table_name} WHERE study_db_id = :study_db_id LIMIT 1"), {
-                                    "study_db_id": study_db_id}).fetchone()
-        return result is not None
+def import_vcf_to_mongodb(vcf_file: str, mongo_url: str, db_name: str, collection_name: str, fields_file: str):
+    cmd = [
+        "mongoimport",
+        "--uri", mongo_url,
+        "--db", db_name,
+        "--collection", collection_name,
+        "--type", "tsv",
+        "--file", vcf_file,
+        "--fieldFile", fields_file,
+        "--ignoreBlanks"
+    ]
 
-# Function to extract metadata from VCF file and insert into PostgreSQL
+    subprocess.run(cmd, check=True)
+    print(
+        f"Data imported to MongoDB collection '{collection_name}' in database '{db_name}'.")
+
+# Function to remove documents where a specific field equals a given value
 
 
-def extract_and_upload_metadata(file: str, database_url: str):
+def remove_documents_by_field(mongo_url: str, db_name: str, collection_name: str, field: str, value: str):
+    client = MongoClient(mongo_url)
+    db = client[db_name]
+    result = db[collection_name].delete_many({field: value})
+    print(f"Deleted {result.deleted_count} documents where {field} equals {value} from collection '{collection_name}'.")
+
+# Function to extract metadata and upload metadata to MongoDB
+
+
+def extract_and_upload_metadata(file: str, mongo_url: str, db_name: str):
+
     study_db_id = 'genomic_data_' + os.path.splitext(os.path.basename(file))[0]
+    collection_name = study_db_id
+    fields_file = read_vcf_and_write_header(file, 'static')
+    # Path to the fields file
 
-    vcf = read_vcf(file)
-    call_set_count = len(vcf.columns) - vcf.columns.get_loc("FORMAT") - 1
-    variant_count = len(vcf)
+    # Import VCF file directly to MongoDB
+    import_vcf_to_mongodb(file, mongo_url, db_name,
+                          collection_name, fields_file)
+    remove_documents_with_field_equal_value(
+        mongo_url, db_name, collection_name, fields_file=fields_file)
+    os.remove(fields_file)
 
-    engine = create_engine(database_url)
+    # Extract metadata
+    call_set_count = 0
+    variant_count = 0
+    headers = []
+    with open(file) as f:
+        for line in f:
+            if line.startswith("##"):
+                continue
+            elif line.startswith("#CHROM"):
+                headers = line.strip().split('\t')
+                call_set_count = len(headers) - headers.index("FORMAT") - 1
+            else:
+                variant_count += 1
+
+    client = MongoClient(mongo_url)
+    db = client[db_name]
 
     metadata = {
         "data_format": "VCF",
@@ -114,19 +138,15 @@ def extract_and_upload_metadata(file: str, database_url: str):
         ]
     }
 
-    metadata_df = pd.DataFrame([metadata])
-    metadata_df["metadata_fields"] = metadata_df["metadata_fields"].apply(
-        json.dumps)
+    db.vcf_metadata.insert_one(metadata)
+    print(f"Metadata uploaded to 'vcf_metadata' collection in the MongoDB database.")
 
-    vcf['study_db_id'] = study_db_id
-    metadata_df.to_sql('vcf_metadata', engine, if_exists='append', index=False)
-    upload_to_postgres(vcf, f'{study_db_id}', engine)
 
-    print(
-        f"Metadata uploaded to 'vcf_metadata' table and data uploaded to 'genomic_data_{study_db_id}' table in the PostgreSQL database.")
+# Example usage
+if __name__ == "__main__":
+    mongo_url = "mongodb://localhost:27017"
+    db_name = "biologicalsamples"
+    file_path = "../Ta_PRJEB31218_IWGSC-RefSeq-v1.0_filtered-SNPs.chr1B.vcf"
 
-    # Upload genomic data to PostgreSQL with a dynamic table name
-    upload_to_postgres(vcf, f'{study_db_id}', engine)
-
-    print(
-        f"Metadata uploaded to 'vcf_metadata' table and data uploaded to 'genomic_data_{study_db_id}' table in the PostgreSQL database.")
+    # Extract and upload metadata
+    extract_and_upload_metadata(file_path, mongo_url, db_name)
